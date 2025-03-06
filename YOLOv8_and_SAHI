@@ -1,0 +1,290 @@
+import os
+import numpy as np
+from ultralytics import YOLO
+import time
+import multiprocessing
+from pathlib import Path
+from PIL import Image
+from sahi import AutoDetectionModel
+from sahi.predict import get_sliced_prediction
+import torch
+import sys
+
+CLASSES_OF_INTEREST = ["traffic light", "fire hydrant", "stop sign", "bird", "cat"]
+
+
+def load_image_paths(directory):
+    return [str(path) for path in Path(directory).rglob('*') if
+            path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.bmp']]
+
+
+# Paths to split directories
+train_dir = r"C:\Users\lenam\cocodataset\images\train"
+val_dir = r"C:\Users\lenam\cocodataset\images\val"
+test_dir = r"C:\Users\lenam\cocodataset\images\test"
+
+# Load image paths for each split
+train_images = load_image_paths(train_dir)
+val_images = load_image_paths(val_dir)
+test_images = load_image_paths(test_dir)
+
+print(f"Train set size: {len(train_images)}")
+print(f"Validation set size: {len(val_images)}")
+print(f"Test set size: {len(test_images)}")
+
+
+class SuppressOutput:
+    def __enter__(self):
+        self._original_stdout = sys.stdout
+        sys.stdout = open(os.devnull, 'w')
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        sys.stdout.close()
+        sys.stdout = self._original_stdout
+
+
+def calculate_iou(box1, box2):
+    # Both boxes are in [x_center, y_center, width, height] format
+    x1, y1, w1, h1 = box1
+    x2, y2, w2, h2 = box2
+
+    # Calculate the coordinates of the intersection rectangle
+    x_left = max(x1 - w1/2, x2 - w2/2)
+    y_top = max(y1 - h1/2, y2 - h2/2)
+    x_right = min(x1 + w1/2, x2 + w2/2)
+    y_bottom = min(y1 + h1/2, y2 + h2/2)
+
+    intersection_area = max(0, x_right - x_left) * max(0, y_bottom - y_top)
+
+    box1_area = w1 * h1
+    box2_area = w2 * h2
+    union_area = box1_area + box2_area - intersection_area
+
+    iou = intersection_area / union_area if union_area > 0 else 0
+
+    return iou
+
+
+def calculate_metrics(predictions, ground_truth, iou_thresholds=np.arange(0.5, 1.0, 0.05)):
+    aps = []
+    true_positives = np.zeros(len(predictions))
+    false_positives = np.zeros(len(predictions))
+
+    for i, pred in enumerate(predictions):
+        best_iou = 0
+        best_gt = None
+        for gt in ground_truth:
+            if pred['label'] == gt['label']:
+                iou = calculate_iou(pred['bounding_box'], gt['bounding_box'])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt = gt
+
+        if best_iou >= 0.5:  # Use 0.5 IoU threshold for precision, recall, and F1
+            if not best_gt.get('matched', False):
+                true_positives[i] = 1
+                best_gt['matched'] = True
+            else:
+                false_positives[i] = 1
+        else:
+            false_positives[i] = 1
+
+    # Compute precision, recall, and F1 score
+    tp_sum = np.sum(true_positives)
+    fp_sum = np.sum(false_positives)
+    fn_sum = len(ground_truth) - tp_sum
+
+    precision = tp_sum / (tp_sum + fp_sum) if (tp_sum + fp_sum) > 0 else 0
+    recall = tp_sum / (tp_sum + fn_sum) if (tp_sum + fn_sum) > 0 else 0
+    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+    # Compute mAP
+    for iou_threshold in iou_thresholds:
+        ap = calculate_ap_at_iou(predictions, ground_truth, iou_threshold)
+        aps.append(ap)
+
+    mAP50 = aps[0]
+    mAP50_95 = np.mean(aps)
+
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1_score,
+        'mAP50': mAP50,
+        'mAP50-95': mAP50_95
+    }
+
+
+def calculate_ap(recalls, precisions):
+    # Add sentinel values to beginning and end
+    recalls = np.concatenate(([0.], recalls, [1.]))
+    precisions = np.concatenate(([0.], precisions, [0.]))
+
+    # Compute the precision envelope
+    for i in range(precisions.size - 1, 0, -1):
+        precisions[i - 1] = np.maximum(precisions[i - 1], precisions[i])
+
+    # Compute area under PR curve
+    indices = np.where(recalls[1:] != recalls[:-1])[0]
+    ap = np.sum((recalls[indices + 1] - recalls[indices]) * precisions[indices + 1])
+    return ap
+
+
+def calculate_ap_at_iou(predictions, ground_truth, iou_threshold):
+    true_positives = np.zeros(len(predictions))
+    false_positives = np.zeros(len(predictions))
+
+    for i, pred in enumerate(predictions):
+        best_iou = 0
+        for gt in ground_truth:
+            if pred['label'] == gt['label']:
+                iou = calculate_iou(pred['bounding_box'], gt['bounding_box'])
+                if iou > best_iou:
+                    best_iou = iou
+
+        if best_iou >= iou_threshold:
+            true_positives[i] = 1
+        else:
+            false_positives[i] = 1
+
+    # Compute precision and recall
+    cumsum = np.cumsum(true_positives)
+    cumsum_fp = np.cumsum(false_positives)
+    recalls = cumsum / len(ground_truth)
+    precisions = cumsum / (cumsum + cumsum_fp)
+
+    return calculate_ap(recalls, precisions)
+
+
+def calculate_uncertainty(confidence):
+    return 1 - confidence
+
+
+def main():
+    # Load the YOLO model
+    yolo_model = YOLO("runs/detect/yolov8x_custom10/weights/best.pt")
+
+    # Load the best trained model with SAHI
+    sahi_model = AutoDetectionModel.from_pretrained(
+        model_type="yolov8",
+        model_path="runs/detect/yolov8x_custom10/weights/best.pt",
+        confidence_threshold=0.3,
+        device="cuda:0" if torch.cuda.is_available() else "cpu"
+    )
+
+    # Evaluating the model on the test set
+    all_metrics = []
+    uncertainty_metrics = {class_name: [] for class_name in CLASSES_OF_INTEREST}
+    size_uncertainty_correlation = []
+    accuracy_uncertainty_correlation = []
+    total_samples = len(test_images)
+    start_time = time.time()
+
+    for i, image_path in enumerate(test_images, 1):
+        # Get image dimensions
+        with Image.open(image_path) as img:
+            image_width, image_height = img.size
+
+        # Run SAHI inference
+        with SuppressOutput():
+            result = get_sliced_prediction(
+                image_path,
+                sahi_model,
+                slice_height=640,
+                slice_width=640,
+                overlap_height_ratio=0.2,
+                overlap_width_ratio=0.2
+            )
+
+        # Convert SAHI results to detections, filtering for classes of interest
+        detections = []
+        for object_prediction in result.object_prediction_list:
+            if object_prediction.category.name in CLASSES_OF_INTEREST and object_prediction.score.value >= 0.3:
+                x, y, w, h = object_prediction.bbox.to_xywh()
+                normalized_bbox = [
+                    (x + w/2) / image_width,
+                    (y + h/2) / image_height,
+                    w / image_width,
+                    h / image_height
+                ]
+                detections.append({
+                    'label': object_prediction.category.name,
+                    'bounding_box': normalized_bbox,
+                    'confidence': object_prediction.score.value
+                })
+
+                # Calculate uncertainty
+                uncertainty = calculate_uncertainty(object_prediction.score.value)
+                uncertainty_metrics[object_prediction.category.name].append(uncertainty)
+
+                # Correlation between object size and uncertainty
+                object_size = normalized_bbox[2] * normalized_bbox[3]  # width * height
+                size_uncertainty_correlation.append((object_size, uncertainty))
+
+        # Get ground truth
+        label_path = image_path.replace('images', 'labels').rsplit('.', 1)[0] + '.txt'
+        ground_truth = []
+        if os.path.exists(label_path):
+            with open(label_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) == 5:  # class x y w h
+                        class_idx = int(parts[0])
+                        class_name = yolo_model.names[class_idx]
+                        if class_name in CLASSES_OF_INTEREST:
+                            ground_truth.append({
+                                'label': class_name,
+                                'bounding_box': [float(coord) for coord in parts[1:]]  # Already normalized
+                            })
+
+        # Calculate metrics
+        metrics = calculate_metrics(detections, ground_truth)
+        all_metrics.append(metrics)
+
+        # Correlation between detection accuracy and uncertainty
+        for det in detections:
+            best_iou = 0
+            for gt in ground_truth:
+                if det['label'] == gt['label']:
+                    iou = calculate_iou(det['bounding_box'], gt['bounding_box'])
+                    best_iou = max(best_iou, iou)
+            uncertainty = calculate_uncertainty(det['confidence'])
+            accuracy_uncertainty_correlation.append((best_iou, uncertainty))
+
+        # Print progress
+        print(f"\rProcessed {i}/{total_samples} images", end="", flush=True)
+
+    end_time = time.time()
+    processing_time = end_time - start_time
+    print(f"\nAll images processed in {processing_time:.2f} seconds.")
+
+    # Calculate average metrics
+    avg_metrics = {
+        'precision': np.mean([m['precision'] for m in all_metrics]),
+        'recall': np.mean([m['recall'] for m in all_metrics]),
+        'f1_score': np.mean([m['f1_score'] for m in all_metrics]),
+        'mAP50': np.mean([m['mAP50'] for m in all_metrics]),
+        'mAP50-95': np.mean([m['mAP50-95'] for m in all_metrics])
+    }
+
+    print("\nValidation Set Metrics:")
+    print("Average Metrics:", avg_metrics)
+
+    # Print uncertainty metrics
+    print("\nUncertainty Metrics:")
+    for class_name, uncertainties in uncertainty_metrics.items():
+        if uncertainties:
+            print(f"{class_name}: Mean Uncertainty = {np.mean(uncertainties):.4f}, Std Uncertainty = {np.std(uncertainties):.4f}")
+
+    # Calculate correlations
+    size_uncertainty_corr = np.corrcoef(np.array(size_uncertainty_correlation).T)[0, 1]
+    accuracy_uncertainty_corr = np.corrcoef(np.array(accuracy_uncertainty_correlation).T)[0, 1]
+
+    print("\nCorrelations:")
+    print(f"Object Size vs Uncertainty: {size_uncertainty_corr:.4f}")
+    print(f"Detection Accuracy vs Uncertainty: {accuracy_uncertainty_corr:.4f}")
+
+
+if __name__ == '__main__':
+    multiprocessing.freeze_support()  # This is necessary for Windows
+    main()
