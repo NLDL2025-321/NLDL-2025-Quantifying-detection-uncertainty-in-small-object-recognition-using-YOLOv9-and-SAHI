@@ -190,8 +190,8 @@ def main():
             result = get_sliced_prediction(
                 image_path,
                 sahi_model,
-                slice_height=640,
-                slice_width=640,
+                slice_height=576,
+                slice_width=576,
                 overlap_height_ratio=0.2,
                 overlap_width_ratio=0.2
             )
