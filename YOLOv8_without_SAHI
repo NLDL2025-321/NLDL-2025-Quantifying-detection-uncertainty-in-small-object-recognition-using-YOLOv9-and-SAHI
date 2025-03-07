@@ -14,9 +14,9 @@ def load_image_paths(directory):
 
 
 # Paths to split directories
-train_dir = r"C:\Users\lenam\cocodataset\images\train"
-val_dir = r"C:\Users\lenam\cocodataset\images\val"
-test_dir = r"C:\Users\lenam\cocodataset\images\test"
+train_dir = r"C:\Users\xxxxx\cocodataset\images\train"
+val_dir = r"C:\Users\xxxxx\cocodataset\images\val"
+test_dir = r"C:\Users\xxxxx\cocodataset\images\test"
 
 # Load image paths for each split
 train_images = load_image_paths(train_dir)
